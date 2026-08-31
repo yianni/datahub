@@ -12,6 +12,7 @@ from typing import (
     Union,
 )
 
+import smart_open.compression as so_compression
 from smart_open import open as smart_open
 
 from datahub.configuration.common import AllowDenyPattern
@@ -33,6 +34,10 @@ from datahub.ingestion.source.azure.abs_utils import (
     get_container_name,
     get_container_relative_path,
     is_abs_uri,
+)
+from datahub.ingestion.source.data_lake_common.path_spec import (
+    SUPPORTED_COMPRESSIONS,
+    PathSpec,
 )
 from datahub.ingestion.source.data_lake_common.profiling.accumulators import (
     ColumnStats,
@@ -65,6 +70,12 @@ if TYPE_CHECKING:
 logger: logging.Logger = logging.getLogger(__name__)
 
 NUM_SAMPLE_ROWS = 20
+
+# S3 and ABS register this alias too, but FileProfiler can be imported directly.
+if ".gzip" not in so_compression._COMPRESSOR_REGISTRY:
+    so_compression.register_compressor(
+        ".gzip", so_compression._COMPRESSOR_REGISTRY[".gz"]
+    )
 
 
 class TableDataLike(Protocol):
@@ -133,6 +144,17 @@ def null_str(value: Any) -> Optional[str]:
     return str(value) if value is not None else None
 
 
+def _get_data_extension(path: str, path_spec: Optional[PathSpec] = None) -> str:
+    """Return the data extension, excluding any compression extension."""
+    root, extension = os.path.splitext(path)
+    enable_compression = path_spec is None or path_spec.enable_compression
+    if enable_compression and extension.lstrip(".") in SUPPORTED_COMPRESSIONS:
+        extension = os.path.splitext(root)[1]
+        if not extension and path_spec is not None and path_spec.default_extension:
+            return f".{path_spec.default_extension}"
+    return extension
+
+
 class FileProfiler:
     """
     Profiles S3/GCS/local files (parquet/csv/tsv/avro/json) via streaming Arrow/fastavro
@@ -190,7 +212,9 @@ class FileProfiler:
             )
         return smart_open(path, "rb")
 
-    def _iter_table_paths(self, table_data: TableDataLike) -> Iterable[str]:
+    def _iter_table_paths(
+        self, table_data: TableDataLike, path_spec: Optional[PathSpec] = None
+    ) -> Iterable[str]:
         """Enumerate every file under a (possibly partitioned) table path.
 
         `table_data.table_path` is a directory when the table spans multiple
@@ -201,8 +225,13 @@ class FileProfiler:
             yield table_data.full_path
             return
 
-        extension = os.path.splitext(table_data.full_path)[1]
+        data_extension = _get_data_extension(table_data.full_path, path_spec)
         table_path = table_data.table_path
+
+        def is_matching_file(path: str) -> bool:
+            if path_spec is not None and not path_spec.allowed(path):
+                return False
+            return _get_data_extension(path, path_spec) == data_extension
 
         if is_s3_uri(table_path):
             if self.aws_config is None:
@@ -212,8 +241,9 @@ class FileProfiler:
             # Reuse the shared lister (paged, structured, GCS-cursor aware)
             # rather than hand-rolling list_objects_v2 pagination here.
             for obj in list_objects_recursive(bucket, prefix, self.aws_config):
-                if obj.key.endswith(extension):
-                    yield f"s3://{obj.bucket_name}/{obj.key}"
+                path = f"s3://{obj.bucket_name}/{obj.key}"
+                if is_matching_file(path):
+                    yield path
         elif is_abs_uri(table_path):
             if self.azure_config is None:
                 raise ValueError("Azure config is required to profile ABS files")
@@ -226,13 +256,15 @@ class FileProfiler:
                 )
             )
             for blob in container_client.list_blobs(name_starts_with=prefix):
-                if blob.name.endswith(extension):
-                    yield f"{abs_prefix}{container}/{blob.name}"
+                path = f"{abs_prefix}{container}/{blob.name}"
+                if is_matching_file(path):
+                    yield path
         else:
             for root, _dirs, files in os.walk(table_path):
                 for name in files:
-                    if name.endswith(extension):
-                        yield os.path.join(root, name)
+                    path = os.path.join(root, name)
+                    if is_matching_file(path):
+                        yield path
 
     def _read_source(
         self, file_obj: IO[bytes], extension: str
@@ -301,10 +333,13 @@ class FileProfiler:
         return field_profile
 
     def get_table_profile(
-        self, table_data: TableDataLike, dataset_urn: str
+        self,
+        table_data: TableDataLike,
+        dataset_urn: str,
+        path_spec: Optional[PathSpec] = None,
     ) -> Iterable[MetadataWorkUnit]:
         config = self.profiling_config
-        extension = os.path.splitext(table_data.full_path)[1]
+        extension = _get_data_extension(table_data.full_path, path_spec)
 
         telemetry.telemetry_instance.ping("data_lake_file", {"extension": extension})
 
@@ -319,7 +354,7 @@ class FileProfiler:
                 # (throttling / AccessDenied) warns and skips this table like a
                 # read failure, instead of propagating out and aborting the
                 # whole source run.
-                paths = list(self._iter_table_paths(table_data))
+                paths = list(self._iter_table_paths(table_data, path_spec))
             except Exception as e:
                 self.report.warning(
                     title="Failed to list files during profiling",

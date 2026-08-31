@@ -1,4 +1,6 @@
+import bz2
 import dataclasses
+import gzip
 import io
 from pathlib import Path
 from typing import Optional
@@ -14,6 +16,10 @@ from moto import mock_aws
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.ingestion.source.aws.aws_common import AwsConnectionConfig
+from datahub.ingestion.source.data_lake_common.path_spec import (
+    SUPPORTED_COMPRESSIONS,
+    PathSpec,
+)
 from datahub.ingestion.source.data_lake_common.profiling.profiler import FileProfiler
 from datahub.ingestion.source.s3.datalake_profiler_config import DataLakeProfilerConfig
 from datahub.ingestion.source.s3.report import DataLakeSourceReport
@@ -53,6 +59,23 @@ def make_table_data(path: str) -> StubTableData:
     )
 
 
+def make_path_spec(table_data: StubTableData, **overrides: object) -> PathSpec:
+    if table_data.partitions:
+        include = f"{table_data.table_path.rstrip('/')}/**"
+        allow_double_stars = True
+    else:
+        parent = table_data.full_path.rsplit("/", 1)[0]
+        include = f"{parent}/*"
+        allow_double_stars = False
+
+    config: dict[str, object] = {
+        "include": include,
+        "allow_double_stars": allow_double_stars,
+    }
+    config.update(overrides)
+    return PathSpec.model_validate(config)
+
+
 def get_profile(work_unit: MetadataWorkUnit) -> DatasetProfileClass:
     assert isinstance(work_unit.metadata, MetadataChangeProposalWrapper)
     profile = work_unit.metadata.aspect
@@ -74,6 +97,40 @@ def parquet_bytes() -> bytes:
         pa.table({"id": pa.array(HIGH_CARDINALITY_IDS, type=pa.int64())}), buf
     )
     return buf.getvalue()
+
+
+def compressed_file_bytes(file_type: str, compression: str) -> bytes:
+    if file_type == "csv":
+        contents = b"id,name\n1,a\n2,b\n"
+    elif file_type == "tsv":
+        contents = b"id\tname\n1\ta\n2\tb\n"
+    elif file_type in {"json", "jsonl"}:
+        contents = b'{"id": 1, "name": "a"}\n{"id": 2, "name": "b"}\n'
+    elif file_type == "avro":
+        buffer = io.BytesIO()
+        fastavro.writer(
+            buffer,
+            {
+                "type": "record",
+                "name": "Test",
+                "fields": [
+                    {"name": "id", "type": "long"},
+                    {"name": "name", "type": "string"},
+                ],
+            },
+            [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}],
+        )
+        contents = buffer.getvalue()
+    elif file_type == "parquet":
+        buffer = io.BytesIO()
+        pq.write_table(pa.table({"id": [1, 2], "name": ["a", "b"]}), buffer)
+        contents = buffer.getvalue()
+    else:
+        raise AssertionError(f"Unsupported test file type: {file_type}")
+
+    if compression == "bz2":
+        return bz2.compress(contents)
+    return gzip.compress(contents)
 
 
 def make_s3_profiler() -> FileProfiler:
@@ -237,6 +294,65 @@ def test_profiles_local_tsv_and_json_files(tmp_path: Path) -> None:
         assert get_profile(work_units[0]).rowCount == 2
 
 
+@pytest.mark.parametrize(
+    "file_type", ["csv", "tsv", "json", "jsonl", "avro", "parquet"]
+)
+@pytest.mark.parametrize("compression", SUPPORTED_COMPRESSIONS)
+def test_profiles_compressed_local_file(
+    tmp_path: Path, file_type: str, compression: str
+) -> None:
+    path = tmp_path / f"test.{file_type}.{compression}"
+    path.write_bytes(compressed_file_bytes(file_type, compression))
+
+    profiler = make_profiler()
+    work_units = list(
+        profiler.get_table_profile(make_table_data(str(path)), "urn:li:dataset:test")
+    )
+
+    assert get_profile(work_units[0]).rowCount == 2
+    assert report_of(profiler).warnings.total_elements == 0
+
+
+def test_profiles_compressed_extensionless_file_with_default_extension(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "part.gz"
+    path.write_bytes(compressed_file_bytes("csv", "gz"))
+
+    profiler = make_profiler()
+    table_data = make_table_data(str(path))
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=make_path_spec(table_data, default_extension="csv"),
+        )
+    )
+
+    assert get_profile(work_units[0]).rowCount == 2
+    assert report_of(profiler).warnings.total_elements == 0
+
+
+def test_plain_extensionless_file_with_default_extension_remains_unsupported(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "part"
+    path.write_bytes(b"id,name\n1,a\n2,b\n")
+
+    profiler = make_profiler()
+    table_data = make_table_data(str(path))
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=make_path_spec(table_data, default_extension="csv"),
+        )
+    )
+
+    assert work_units == []
+    assert report_of(profiler).warnings.total_elements > 0
+
+
 def test_corrupt_file_with_valid_extension_reports_warning(tmp_path: Path) -> None:
     # Valid extension but unreadable bytes exercises the read-exception path
     # (distinct from an unsupported extension).
@@ -290,7 +406,13 @@ def test_profiles_partitioned_s3_table_lists_all_files() -> None:
         table_path="s3://test-bucket/data",
         partitions=["year=2023", "year=2024"],  # truthy -> enumerate the prefix
     )
-    work_units = list(profiler.get_table_profile(table_data, "urn:li:dataset:test"))
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=make_path_spec(table_data),
+        )
+    )
 
     profile = get_profile(work_units[0])
     # Both partition files (200 rows each) are streamed into one profile.
@@ -348,6 +470,137 @@ def test_profiles_partitioned_local_directory(tmp_path: Path) -> None:
     work_units = list(profiler.get_table_profile(table_data, "urn:li:dataset:test"))
 
     assert get_profile(work_units[0]).rowCount == 400
+
+
+def test_partitioned_table_matches_logical_extension(tmp_path: Path) -> None:
+    table_dir = tmp_path / "events"
+    first = table_dir / "year=2023"
+    first.mkdir(parents=True)
+    (first / "part.csv.gz").write_bytes(compressed_file_bytes("csv", "gz"))
+
+    second = table_dir / "year=2024"
+    second.mkdir()
+    (second / "part.csv.bz2").write_bytes(compressed_file_bytes("csv", "bz2"))
+    (second / "part.json.gz").write_bytes(compressed_file_bytes("json", "gz"))
+
+    third = table_dir / "year=2025"
+    third.mkdir()
+    (third / "part.csv").write_bytes(b"id,name\n1,a\n2,b\n")
+    (third / "part.csv.gzip").write_bytes(compressed_file_bytes("csv", "gzip"))
+
+    profiler = make_profiler()
+    table_data = StubTableData(
+        display_name="events",
+        full_path=str(first / "part.csv.gz"),
+        table_path=str(table_dir),
+        partitions=["year=2023", "year=2024", "year=2025"],
+    )
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=make_path_spec(table_data),
+        )
+    )
+
+    assert get_profile(work_units[0]).rowCount == 8
+    assert report_of(profiler).warnings.total_elements == 0
+
+
+def test_partitioned_table_respects_restrictive_include(tmp_path: Path) -> None:
+    table_dir = tmp_path / "events"
+    first = table_dir / "year=2023"
+    first.mkdir(parents=True)
+    (first / "part.csv.gz").write_bytes(compressed_file_bytes("csv", "gz"))
+
+    second = table_dir / "year=2024"
+    second.mkdir()
+    (second / "part.csv.bz2").write_bytes(compressed_file_bytes("csv", "bz2"))
+    (second / "part.csv").write_bytes(b"id,name\n1,a\n2,b\n")
+    (second / "part.csv.gzip").write_bytes(compressed_file_bytes("csv", "gzip"))
+
+    profiler = make_profiler()
+    table_data = StubTableData(
+        display_name="events",
+        full_path=str(first / "part.csv.gz"),
+        table_path=str(table_dir),
+        partitions=["year=2023", "year=2024"],
+    )
+    path_spec = make_path_spec(
+        table_data,
+        include=f"{table_dir}/*/*.csv.gz",
+        allow_double_stars=False,
+    )
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=path_spec,
+        )
+    )
+
+    assert get_profile(work_units[0]).rowCount == 2
+    assert report_of(profiler).warnings.total_elements == 0
+
+
+def test_partitioned_table_respects_exclude(tmp_path: Path) -> None:
+    table_dir = tmp_path / "events"
+    first = table_dir / "year=2023"
+    first.mkdir(parents=True)
+    (first / "part.csv.gz").write_bytes(compressed_file_bytes("csv", "gz"))
+
+    second = table_dir / "year=2024"
+    second.mkdir()
+    excluded = second / "part.csv.gz"
+    excluded.write_bytes(compressed_file_bytes("csv", "gz"))
+
+    profiler = make_profiler()
+    table_data = StubTableData(
+        display_name="events",
+        full_path=str(first / "part.csv.gz"),
+        table_path=str(table_dir),
+        partitions=["year=2023", "year=2024"],
+    )
+    path_spec = make_path_spec(table_data, exclude=[str(excluded)])
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=path_spec,
+        )
+    )
+
+    assert get_profile(work_units[0]).rowCount == 2
+    assert report_of(profiler).warnings.total_elements == 0
+
+
+def test_partitioned_table_respects_disabled_compression(tmp_path: Path) -> None:
+    table_dir = tmp_path / "events"
+    first = table_dir / "year=2023"
+    first.mkdir(parents=True)
+    (first / "part.csv").write_bytes(b"id,name\n1,a\n2,b\n")
+
+    second = table_dir / "year=2024"
+    second.mkdir()
+    (second / "part.csv.gz").write_bytes(compressed_file_bytes("csv", "gz"))
+
+    profiler = make_profiler()
+    table_data = StubTableData(
+        display_name="events",
+        full_path=str(first / "part.csv"),
+        table_path=str(table_dir),
+        partitions=["year=2023", "year=2024"],
+    )
+    work_units = list(
+        profiler.get_table_profile(
+            table_data,
+            "urn:li:dataset:test",
+            path_spec=make_path_spec(table_data, enable_compression=False),
+        )
+    )
+
+    assert get_profile(work_units[0]).rowCount == 2
+    assert report_of(profiler).warnings.total_elements == 0
 
 
 @pytest.mark.parametrize(
@@ -488,7 +741,13 @@ def test_profiles_partitioned_abs_table_lists_blobs() -> None:
         "datahub.ingestion.source.data_lake_common.profiling.profiler.smart_open",
         side_effect=lambda *a, **k: io.BytesIO(parquet_bytes()),
     ):
-        work_units = list(profiler.get_table_profile(table_data, "urn:li:dataset:test"))
+        work_units = list(
+            profiler.get_table_profile(
+                table_data,
+                "urn:li:dataset:test",
+                path_spec=make_path_spec(table_data),
+            )
+        )
 
     # Listed under the container-relative prefix parsed from the https URI.
     container_client.list_blobs.assert_called_once()
