@@ -48,6 +48,7 @@ from datahub.ingestion.source.data_lake_common.object_store import (
     create_object_store_adapter,
 )
 from datahub.ingestion.source.data_lake_common.path_spec import (
+    SUPPORTED_COMPRESSIONS,
     FolderTraversalMethod,
     PathSpec,
 )
@@ -106,6 +107,28 @@ profiling_flags_to_report = [
 
 URI_SCHEME_REGEX = re.compile(r"^[a-z0-9]+://")
 
+_CONTENT_TYPE_TO_FILE_TYPES = {
+    "application/avro": ("avro",),
+    "application/json": ("json", "jsonl"),
+    "application/vnd.apache.parquet": ("parquet",),
+    "text/csv": ("csv",),
+    "text/tab-separated-values": ("tsv",),
+}
+
+
+def _normalize_content_type(content_type: Optional[str]) -> Optional[str]:
+    if content_type is None:
+        return None
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    return normalized or None
+
+
+def _get_path_file_type(path: str, enable_compression: bool) -> Optional[str]:
+    file_type = pathlib.Path(path).suffix.lstrip(".")
+    if enable_compression and file_type in SUPPORTED_COMPRESSIONS:
+        file_type = pathlib.Path(path).with_suffix("").suffix.lstrip(".")
+    return file_type or None
+
 
 def partitioned_folder_comparator(folder1: str, folder2: str) -> int:
     # Try to convert to number and compare if the folder name is a number
@@ -138,6 +161,7 @@ class Folder:
     sample_file: str
     partition_id: Optional[List[Tuple[str, str]]] = None
     is_partition: bool = False
+    content_type: Optional[str] = None
 
     def partition_id_text(self) -> Optional[str]:
         return (
@@ -154,6 +178,7 @@ class FolderInfo:
     min_time: datetime
     max_time: datetime
     latest_obj: Any
+    latest_content_type: Optional[str]
 
 
 @dataclasses.dataclass
@@ -367,6 +392,7 @@ class S3Source(StatefulIngestionSourceBase):
     def _get_inferrer(
         self, extension: str, content_type: Optional[str]
     ) -> Optional[SchemaInferenceBase]:
+        content_type = _normalize_content_type(content_type)
         if content_type == "application/vnd.apache.parquet":
             return parquet.ParquetInferrer()
         elif content_type == "text/csv":
@@ -768,16 +794,6 @@ class S3Source(StatefulIngestionSourceBase):
         List[Folder]: A list of Folder objects representing the partitions found.
         """
 
-        def _is_allowed_path(path_spec_: PathSpec, s3_uri: str) -> bool:
-            # Normalize URI for pattern matching
-            normalized_uri = self._normalize_uri_for_pattern_matching(s3_uri)
-
-            allowed = path_spec_.allowed(normalized_uri)
-            if not allowed:
-                logger.debug(f"File {s3_uri} not allowed and skipping")
-                self.report.report_file_dropped(s3_uri)
-            return allowed
-
         # Add any remaining parts of the path_spec before globs to the URI and prefix,
         # so that we don't unnecessarily list too many objects.
         if not uri.endswith("/"):
@@ -785,6 +801,14 @@ class S3Source(StatefulIngestionSourceBase):
         remaining = path_spec.get_remaining_glob_include(uri).split("*")[0]
         uri += posixpath.dirname(remaining)
         prefix = posixpath.basename(remaining)
+
+        s3 = None
+        if self.source_config.use_s3_content_type:
+            if self.source_config.aws_config is None:
+                raise ValueError("aws_config not set")
+            s3 = self.source_config.aws_config.get_s3_resource(
+                self.source_config.verify_ssl
+            )
 
         # Process objects in a memory-efficient streaming fashion
         # Instead of loading all objects into memory, we'll accumulate folder data incrementally
@@ -799,8 +823,11 @@ class S3Source(StatefulIngestionSourceBase):
                 ):
                     self.report.objects_listed += 1
                     s3_path = self.create_s3_path(obj.bucket_name, obj.key)
+                    content_type = self._get_s3_content_type(
+                        s3, obj.bucket_name, obj.key
+                    )
 
-                    if not _is_allowed_path(path_spec, s3_path):
+                    if not self._is_s3_path_allowed(path_spec, s3_path, content_type):
                         continue
 
                     # Extract the directory name (folder) from the object key
@@ -814,6 +841,7 @@ class S3Source(StatefulIngestionSourceBase):
                             min_time=obj.last_modified,
                             max_time=obj.last_modified,
                             latest_obj=obj,
+                            latest_content_type=content_type,
                         )
 
                     # Update folder statistics incrementally
@@ -827,6 +855,7 @@ class S3Source(StatefulIngestionSourceBase):
                     if obj.last_modified > folder_info.max_time:
                         folder_info.max_time = obj.last_modified
                         folder_info.latest_obj = obj
+                        folder_info.latest_content_type = content_type
             finally:
                 # Record elapsed even if listing raises mid-stream.
                 self.report.listing_time_taken_secs += listing_timer.elapsed_seconds()
@@ -850,10 +879,60 @@ class S3Source(StatefulIngestionSourceBase):
                 modification_time=folder_info.max_time,
                 sample_file=max_file_s3_path,
                 size=folder_info.total_size,
+                content_type=folder_info.latest_content_type,
             )
 
     def create_s3_path(self, bucket_name: str, key: str) -> str:
         return f"s3://{bucket_name}/{key}"
+
+    def _get_s3_content_type(
+        self,
+        s3: Optional[Any],
+        bucket_name: str,
+        key: str,
+    ) -> Optional[str]:
+        if not self.source_config.use_s3_content_type:
+            return None
+        if s3 is None:
+            raise ValueError("S3 resource is required to retrieve content type")
+        content_type = s3.Object(bucket_name, key).content_type
+        return _normalize_content_type(content_type)
+
+    def _is_s3_path_allowed(
+        self,
+        path_spec: PathSpec,
+        s3_path: str,
+        content_type: Optional[str],
+    ) -> bool:
+        normalized_uri = self._normalize_uri_for_pattern_matching(s3_path)
+        content_type_file_types = _CONTENT_TYPE_TO_FILE_TYPES.get(
+            _normalize_content_type(content_type) or ""
+        )
+
+        allowed = path_spec.allowed(
+            normalized_uri,
+            ignore_ext=content_type_file_types is not None,
+        )
+        if allowed and content_type_file_types is not None:
+            extension = pathlib.Path(normalized_uri).suffix.lstrip(".")
+            if extension in SUPPORTED_COMPRESSIONS and not path_spec.enable_compression:
+                allowed = False
+            else:
+                path_file_type = _get_path_file_type(
+                    normalized_uri,
+                    enable_compression=path_spec.enable_compression,
+                )
+                if path_file_type in content_type_file_types:
+                    content_type_file_types = (path_file_type,)
+                allowed = any(
+                    file_type in path_spec.file_types
+                    for file_type in content_type_file_types
+                )
+
+        if not allowed:
+            logger.debug(f"File {s3_path} not allowed and skipping")
+            self.report.report_file_dropped(s3_path)
+        return allowed
 
     def s3_browser(self, path_spec: PathSpec, sample_size: int) -> Iterable[BrowsePath]:
         """
@@ -1063,6 +1142,7 @@ class S3Source(StatefulIngestionSourceBase):
                             timestamp=latest_file.modification_time,  # Latest timestamp
                             size=total_size,  # Size of processed partitions
                             partitions=partitions,  # Partition metadata
+                            content_type=latest_file.content_type,
                         )
                     else:
                         logger.warning(
@@ -1126,11 +1206,12 @@ class S3Source(StatefulIngestionSourceBase):
             aws_config=self.source_config.aws_config,
         ):
             s3_path = self.create_s3_path(obj.bucket_name, obj.key)
+            content_type = self._get_s3_content_type(s3, obj.bucket_name, obj.key)
 
-            # Get content type if configured
-            content_type = None
-            if self.source_config.use_s3_content_type:
-                content_type = s3.Object(obj.bucket_name, obj.key).content_type
+            if self.source_config.use_s3_content_type and not self._is_s3_path_allowed(
+                path_spec, s3_path, content_type
+            ):
+                continue
 
             # Create one BrowsePath per file
             yield BrowsePath(
@@ -1192,10 +1273,11 @@ class S3Source(StatefulIngestionSourceBase):
                         browse_path.file
                     )
 
-                    if not path_spec.allowed(
-                        normalized_file_path,
-                        ignore_ext=self.is_s3_platform()
-                        and self.source_config.use_s3_content_type,
+                    content_type_filtered = (
+                        self.is_s3_platform() and self.source_config.use_s3_content_type
+                    )
+                    if not content_type_filtered and not path_spec.allowed(
+                        normalized_file_path
                     ):
                         continue
                     table_data = self.extract_table_data(path_spec, browse_path)

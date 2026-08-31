@@ -1,3 +1,4 @@
+import gzip
 import logging
 import os
 from datetime import datetime, timezone
@@ -24,6 +25,9 @@ from datahub.ingestion.source.aws.s3_boto_utils import (
     list_objects_recursive_path,
 )
 from datahub.ingestion.source.data_lake_common.data_lake_utils import ContainerWUCreator
+from datahub.ingestion.source.data_lake_common.object_store import (
+    create_object_store_adapter,
+)
 from datahub.ingestion.source.data_lake_common.path_spec import PathSpec
 from datahub.ingestion.source.s3.source import (
     Folder,
@@ -59,7 +63,9 @@ def s3_resource(s3):
     yield s3.resource("s3")
 
 
-def _get_s3_source(path_spec_: PathSpec) -> S3Source:
+def _get_s3_source(
+    path_spec_: PathSpec, *, use_s3_content_type: bool = False
+) -> S3Source:
     return S3Source.create(
         config_dict={
             "path_spec": {
@@ -67,12 +73,16 @@ def _get_s3_source(path_spec_: PathSpec) -> S3Source:
                 "table_name": path_spec_.table_name,
                 "emit_folders_only": path_spec_.emit_folders_only,
                 "exclude": path_spec_.exclude,
+                "file_types": path_spec_.file_types,
+                "default_extension": path_spec_.default_extension,
+                "enable_compression": path_spec_.enable_compression,
                 "include_hidden_folders": path_spec_.include_hidden_folders,
             },
             "aws_config": {
                 "aws_access_key_id": "test",
                 "aws_secret_access_key": "test",
             },
+            "use_s3_content_type": use_s3_content_type,
         },
         ctx=PipelineContext(run_id="test-s3"),
     )
@@ -342,6 +352,156 @@ def test_get_folder_info_returns_latest_file_in_each_folder(s3_resource):
     assert res[1].sample_file == "s3://my-bucket/my-folder/dir2/0001.csv"
 
 
+@pytest.mark.parametrize(
+    "use_s3_content_type, expected_count",
+    [
+        pytest.param(True, 1, id="enabled"),
+        pytest.param(False, 0, id="disabled"),
+    ],
+)
+def test_templated_path_uses_s3_content_type_for_extensionless_file(
+    s3_resource, use_s3_content_type: bool, expected_count: int
+) -> None:
+    path_spec = PathSpec(include="s3://my-bucket/{table}/*")
+    bucket = s3_resource.Bucket("my-bucket")
+    bucket.create()
+    bucket.put_object(
+        Key="orders/part-000",
+        Body=b"order_id,total\n1,12.50\n",
+        ContentType="TEXT/CSV; charset=UTF-8",
+    )
+
+    source = _get_s3_source(path_spec, use_s3_content_type=use_s3_content_type)
+    configured_path_spec = source.source_config.path_specs[0]
+    browse_paths = list(source.s3_browser(configured_path_spec, sample_size=100))
+
+    assert len(browse_paths) == expected_count
+    if use_s3_content_type:
+        assert browse_paths[0].content_type == "text/csv"
+        table_data = source.extract_table_data(configured_path_spec, browse_paths[0])
+        fields = source.get_fields(table_data, configured_path_spec)
+        assert [field.fieldPath for field in fields] == ["order_id", "total"]
+
+
+@pytest.mark.parametrize("use_gcs_adapter", [False, True])
+def test_simple_path_normalizes_s3_content_type(
+    s3_resource, use_gcs_adapter: bool
+) -> None:
+    path_spec = PathSpec(include="s3://my-bucket/*", file_types=["csv"])
+    bucket = s3_resource.Bucket("my-bucket")
+    bucket.create()
+    bucket.put_object(
+        Key="part-000",
+        Body=b"order_id,total\n1,12.50\n",
+        ContentType="TEXT/CSV; charset=UTF-8",
+    )
+    bucket.put_object(
+        Key="part-001",
+        Body=b'{"order_id": 2, "total": 8.00}',
+        ContentType="application/json",
+    )
+
+    source = _get_s3_source(path_spec, use_s3_content_type=True)
+    if use_gcs_adapter:
+        source = create_object_store_adapter("gcs").apply_customizations(source)
+    configured_path_spec = source.source_config.path_specs[0]
+    browse_paths = list(source.s3_browser(configured_path_spec, sample_size=100))
+
+    assert len(browse_paths) == 1
+    assert browse_paths[0].content_type == "text/csv"
+    scheme = "gs" if use_gcs_adapter else "s3"
+    assert list(source.get_report().filtered) == [f"{scheme}://my-bucket/part-001"]
+    table_data = source.extract_table_data(configured_path_spec, browse_paths[0])
+    fields = source.get_fields(table_data, configured_path_spec)
+    assert [field.fieldPath for field in fields] == ["order_id", "total"]
+
+
+@pytest.mark.parametrize(
+    "key, body",
+    [
+        pytest.param("events.jsonl", b'{"id": 1}\n{"id": 2}\n', id="plain"),
+        pytest.param(
+            "events.jsonl.gz",
+            gzip.compress(b'{"id": 1}\n{"id": 2}\n'),
+            id="compressed",
+        ),
+    ],
+)
+def test_json_content_type_preserves_jsonl_file_type(
+    s3_resource, key: str, body: bytes
+) -> None:
+    path_spec = PathSpec(include="s3://my-bucket/*", file_types=["jsonl"])
+    bucket = s3_resource.Bucket("my-bucket")
+    bucket.create()
+    bucket.put_object(Key=key, Body=body, ContentType="application/json")
+
+    source = _get_s3_source(path_spec, use_s3_content_type=True)
+    configured_path_spec = source.source_config.path_specs[0]
+    browse_paths = list(source.s3_browser(configured_path_spec, sample_size=100))
+
+    assert len(browse_paths) == 1
+    table_data = source.extract_table_data(configured_path_spec, browse_paths[0])
+    fields = source.get_fields(table_data, configured_path_spec)
+    assert [field.fieldPath for field in fields] == ["id"]
+
+
+def test_templated_path_filters_each_file_by_s3_content_type(s3_resource) -> None:
+    path_spec = PathSpec(
+        include="s3://my-bucket/{table}/*",
+        file_types=["csv"],
+    )
+    bucket = s3_resource.Bucket("my-bucket")
+    bucket.create()
+
+    allowed_by_content_type = b"order_id,total\n1,12.50\n"
+    allowed_by_extension = b"order_id,total\n2,8.00\n"
+    with time_machine.travel("2025-01-01 01:00:00", tick=False):
+        bucket.put_object(
+            Key="orders/part-000",
+            Body=allowed_by_content_type,
+            ContentType="text/csv",
+        )
+    with time_machine.travel("2025-01-01 02:00:00", tick=False):
+        bucket.put_object(
+            Key="orders/part-001.csv",
+            Body=allowed_by_extension,
+            ContentType="application/octet-stream",
+        )
+    with time_machine.travel("2025-01-01 03:00:00", tick=False):
+        bucket.put_object(
+            Key="orders/part-002",
+            Body=b'{"order_id": 3, "total": 4.50}',
+            ContentType="application/json",
+        )
+    with time_machine.travel("2025-01-01 04:00:00", tick=False):
+        bucket.put_object(
+            Key="orders/part-003.txt",
+            Body=b"not a supported file type",
+            ContentType="application/octet-stream",
+        )
+
+    source = _get_s3_source(path_spec, use_s3_content_type=True)
+    configured_path_spec = source.source_config.path_specs[0]
+    with patch.object(
+        source,
+        "_get_s3_content_type",
+        wraps=source._get_s3_content_type,
+    ) as get_content_type:
+        browse_paths = list(source.s3_browser(configured_path_spec, sample_size=100))
+
+    assert get_content_type.call_count == 4
+    assert len(browse_paths) == 1
+    assert browse_paths[0].file == "s3://my-bucket/orders/part-001.csv"
+    assert browse_paths[0].content_type == "application/octet-stream"
+    assert browse_paths[0].size == len(allowed_by_content_type) + len(
+        allowed_by_extension
+    )
+    assert set(source.get_report().filtered) == {
+        "s3://my-bucket/orders/part-002",
+        "s3://my-bucket/orders/part-003.txt",
+    }
+
+
 def test_get_folder_info_records_listing_instrumentation(s3_resource):
     """get_folder_info records the number of objects listed and listing time."""
     path_spec = PathSpec(
@@ -429,7 +589,7 @@ def test_get_folder_info_ignores_disallowed_path(s3_resource, caplog):
     # assert
     expected_called_s3_uri = "s3://my-bucket/my-folder/ignore/this/path/0001.csv"
 
-    assert allowed.call_args_list == [call(expected_called_s3_uri)], (
+    assert allowed.call_args_list == [call(expected_called_s3_uri, ignore_ext=False)], (
         "File should be checked if it's allowed"
     )
     assert f"File {expected_called_s3_uri} not allowed and skipping" in caplog.text, (
